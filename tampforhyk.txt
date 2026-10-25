@@ -1,0 +1,397 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then
+    warn("No LocalPlayer available.")
+    return
+end
+
+local function sendNotification(Ti, Te)
+    pcall(function()
+        StarterGui:SetCore('SendNotification', {Title = tostring(Ti), Text = tostring(Te)})
+    end)
+end
+
+local DETECTION_RADIUS = 9
+local ORBIT_SPEED_DEGREES = 1220
+local SPIN_SPEED_DEGREES  = 7220
+local MIN_ORBIT_RADIUS = 1.5
+local ARM_MARGIN = 0.5
+local ARM_ONLY_DISTANCE = 3
+
+local ORBIT_SPEED = math.rad(ORBIT_SPEED_DEGREES)
+local SPIN_SPEED  = math.rad(SPIN_SPEED_DEGREES)
+
+getgenv().Dist = 20
+
+local BLATANT_OFFSETS = { -1.5, -0.5, 0.5, 1.5 }
+local BLATANT_RADIUS_EXTRA = 1.25
+
+local orbitEnabled = true
+local tankEnabled  = false -- DO NOT TOGGLE THIS SHIT NIGGA, U WILL BE BANNED
+local blatantMode  = true
+
+local trackedHandles = {}
+
+local function getTorsoPart(character)
+    if not character then return nil end
+    local candidates = {"HumanoidRootPart", "UpperTorso", "Torso"}
+    for _, name in ipairs(candidates) do
+        local p = character:FindFirstChild(name)
+        if p and p:IsA("BasePart") then
+            return p
+        end
+    end
+    return nil
+end
+
+local function getArmParts(character)
+    if not character then return {} end
+    local arms = {}
+    local r15Names = {"LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm"}
+    for _, name in ipairs(r15Names) do
+        local p = character:FindFirstChild(name)
+        if p and p:IsA("BasePart") then table.insert(arms, p) end
+    end
+    if #arms == 0 then
+        local pL = character:FindFirstChild("Left Arm") or character:FindFirstChild("LeftArm")
+        local pR = character:FindFirstChild("Right Arm") or character:FindFirstChild("RightArm")
+        if pL and pL:IsA("BasePart") then table.insert(arms, pL) end
+        if pR and pR:IsA("BasePart") then table.insert(arms, pR) end
+    end
+    return arms
+end
+
+local function classifyArms(armParts)
+    local left, right
+    for _, p in ipairs(armParts) do
+        local name = p.Name:lower()
+        if name:find("left") then left = p
+        elseif name:find("right") then right = p
+        end
+    end
+    if not left or not right then
+        table.sort(armParts, function(a,b) return a.Position.X < b.Position.X end)
+        if #armParts >= 1 and not left then left = armParts[1] end
+        if #armParts >= 2 and not right then right = armParts[2] end
+    end
+    return left, right
+end
+
+local function computeOrbitParams(torsoPart, armParts)
+    if not torsoPart then
+        return MIN_ORBIT_RADIUS, 0
+    end
+
+    local localRef = nil
+    if localPlayer and localPlayer.Character then
+        localRef = getTorsoPart(localPlayer.Character)
+    end
+
+    local leftArm, rightArm = classifyArms(armParts)
+
+    if not leftArm and not rightArm then
+        return MIN_ORBIT_RADIUS, 0
+    end
+
+    local chooseArm = nil
+    local chosenName = "unknown"
+    if localRef and leftArm and rightArm then
+        local dL = (leftArm.Position - localRef.Position).Magnitude
+        local dR = (rightArm.Position - localRef.Position).Magnitude
+        if dL <= dR then
+            chooseArm = leftArm
+            chosenName = "left"
+        else
+            chooseArm = rightArm
+            chosenName = "right"
+        end
+    else
+        if leftArm then
+            chooseArm = leftArm
+            chosenName = "left"
+        else
+            chooseArm = rightArm
+            chosenName = "right"
+        end
+    end
+
+    local torsoPos = torsoPart.Position
+    local offset = chooseArm.Position - torsoPos
+    local xz = math.sqrt(offset.X*offset.X + offset.Z*offset.Z)
+
+    if chosenName == "right" and localRef then
+        local distToLocal = (chooseArm.Position - localRef.Position).Magnitude
+        if distToLocal > ARM_ONLY_DISTANCE then
+            local radius = math.max(MIN_ORBIT_RADIUS, ARM_MARGIN)
+            local yOffset = offset.Y
+            return radius, yOffset
+        end
+    end
+
+    local radius = math.max(MIN_ORBIT_RADIUS, xz + ARM_MARGIN)
+    local yOffset = offset.Y
+
+    return radius, yOffset
+end
+
+local function createDetachedClone(handle)
+    if not handle or not handle:IsA("BasePart") then return nil end
+    local clone = handle:Clone()
+    clone.Parent = workspace
+    clone.CanCollide = false
+    pcall(function() clone.Massless = true end)
+    clone.Anchored = true
+    clone.CFrame = handle.CFrame
+    return clone
+end
+
+local function startTrackingHandle(handle)
+    if trackedHandles[handle] then return end
+    if not handle or not handle.Parent then return end
+
+    local prev = {
+        Transparency = handle.Transparency,
+        CanCollide = handle.CanCollide,
+        Anchored = handle.Anchored,
+    }
+
+    pcall(function()
+        handle.Transparency = 1
+        handle.CanCollide = false
+        handle.Anchored = false
+    end)
+
+    local clone = createDetachedClone(handle)
+    if not clone then
+        pcall(function()
+            handle.Transparency = prev.Transparency
+            handle.CanCollide = prev.CanCollide
+            handle.Anchored = prev.Anchored
+        end)
+        return
+    end
+
+    trackedHandles[handle] = {
+        clone = clone,
+        orbiting = false,
+        targetTorso = nil,
+        angle = 0,
+        spinAngle = 0,
+        radius = MIN_ORBIT_RADIUS,
+        yOffset = 0,
+        prevProps = prev,
+    }
+end
+
+local function stopTrackingHandle(handle)
+    local data = trackedHandles[handle]
+    if not data then return end
+    pcall(function()
+        if handle and handle.Parent then
+            handle.Transparency = data.prevProps.Transparency or 0
+            handle.CanCollide = data.prevProps.CanCollide or false
+            handle.Anchored = data.prevProps.Anchored or false
+        end
+    end)
+    pcall(function()
+        if data.clone and data.clone.Parent then
+            data.clone:Destroy()
+        end
+    end)
+    trackedHandles[handle] = nil
+end
+
+local function findNearbyTorso(position, maxDist)
+    local closest, bestDist = nil, maxDist
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= localPlayer and p.Character then
+            local torso = getTorsoPart(p.Character)
+            if torso then
+                local success, d = pcall(function() return (torso.Position - position).Magnitude end)
+                if success and d <= bestDist then
+                    bestDist = d
+                    closest = torso
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function scanCharacterForTools(character)
+    if not character then return end
+    for _, child in ipairs(character:GetChildren()) do
+        if child:IsA("Tool") then
+            local handle = child:FindFirstChild("Handle")
+            if handle and handle:IsA("BasePart") then
+            end
+        end
+    end
+end
+
+local tankParts = {"Torso", "Head", "Left Arm"}
+
+local function applyTanking()
+    if localPlayer.Character then
+        local character = localPlayer.Character
+        for _, partName in ipairs(tankParts) do
+            local part = character:FindFirstChild(partName)
+            if part and part:IsA("BasePart") then
+                part.CanTouch = false
+            end
+        end
+    end
+end
+
+local function removeTanking()
+    if localPlayer.Character then
+        local character = localPlayer.Character
+        for _, partName in ipairs(tankParts) do
+            local part = character:FindFirstChild(partName)
+            if part and part:IsA("BasePart") then
+                part.CanTouch = true
+            end
+        end
+    end
+end
+
+local function isPlayerMoving()
+    local character = localPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        return humanoid and humanoid.MoveDirection.Magnitude > 0
+    end
+    return false
+end
+
+local function misdirectHitbox()
+    if localPlayer.Character and isPlayerMoving() then
+        local character = localPlayer.Character
+        local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+        if humanoidRootPart then
+            local offsetX = math.random(-2, 2) / 10
+            local offsetZ = math.random(-2, 2) / 10
+            humanoidRootPart.Velocity = humanoidRootPart.Velocity + Vector3.new(offsetX, 0, offsetZ)
+        end
+    end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.J then
+        blatantMode = not blatantMode
+        sendNotification("Liam's TAMP - BLATANT", (blatantMode and "BLATANT MODE Enabled" or "BLATANT MODE Disabled"))
+        sendNotification("If you're skidding this fuck you", (blatantMode and "Stupid fucking skidders" or "KYS if ur skidding my script AND IF U GAVE TS AWAY WITHOUT TELLING ME"))
+    end
+end)
+
+local function getLocalToolHandles()
+    local handles = {}
+    if not localPlayer.Character then return handles end
+    for _, child in ipairs(localPlayer.Character:GetChildren()) do
+        if child:IsA("Tool") then
+            local h = child:FindFirstChild("Handle")
+            if h and h:IsA("BasePart") then
+                table.insert(handles, h)
+            end
+        end
+    end
+    return handles
+end
+
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(char)
+        scanCharacterForTools(char)
+    end)
+end)
+
+localPlayer.CharacterAdded:Connect(function(char)
+    for handle, _ in pairs(trackedHandles) do
+        stopTrackingHandle(handle)
+    end
+    scanCharacterForTools(char)
+end)
+
+local lastTime = tick()
+RunService.RenderStepped:Connect(function()
+    local now = tick()
+    local dt = math.max(0, now - lastTime)
+    lastTime = now
+
+    if tankEnabled then
+        applyTanking()
+        misdirectHitbox()
+    else
+        removeTanking()
+    end
+
+    if localPlayer.Character then
+        scanCharacterForTools(localPlayer.Character)
+
+        local handles = getLocalToolHandles()
+
+        for _, handle in ipairs(handles) do
+            local torso = findNearbyTorso(handle.Position, DETECTION_RADIUS)
+
+            if orbitEnabled and torso then
+                if not trackedHandles[handle] then
+                    startTrackingHandle(handle)
+                end
+
+                local data = trackedHandles[handle]
+                if data and data.clone then
+                    local armParts = getArmParts(torso.Parent)
+                    local baseRadius, baseYOffset = computeOrbitParams(torso, armParts)
+
+                    data.targetTorso = torso
+
+                    data.angle = (data.angle or 0) + ORBIT_SPEED * dt
+                    data.spinAngle = (data.spinAngle or 0) + SPIN_SPEED * dt
+
+                    if blatantMode then
+                        local n = #BLATANT_OFFSETS
+                        if n > 0 then
+                            local idx = (math.floor((data.angle / (2 * math.pi)) * n) % n) + 1
+                            data.yOffset = BLATANT_OFFSETS[idx]
+                        else
+                            data.yOffset = baseYOffset
+                        end
+                        data.radius = math.max(MIN_ORBIT_RADIUS, baseRadius * BLATANT_RADIUS_EXTRA)
+                    else
+                        data.yOffset = baseYOffset
+                        data.radius = baseRadius
+                    end
+
+                    local cx, cy, cz = torso.Position.X, torso.Position.Y + data.yOffset, torso.Position.Z
+                    local xOff = math.cos(data.angle) * data.radius
+                    local zOff = math.sin(data.angle) * data.radius
+                    local pos = Vector3.new(cx + xOff, cy, cz + zOff)
+
+                    local lookCFrame = CFrame.new(pos, Vector3.new(cx, cy, cz))
+                    local spinCFrame = CFrame.Angles(0, data.spinAngle, 0)
+                    data.clone.CFrame = lookCFrame * spinCFrame
+
+                    data.orbiting = true
+                end
+            else
+                if trackedHandles[handle] then
+                    stopTrackingHandle(handle)
+                end
+            end
+        end
+
+        for handle, data in pairs(trackedHandles) do
+            if not handle.Parent or handle.Parent ~= localPlayer.Character then
+                stopTrackingHandle(handle)
+            end
+        end
+    else
+        for handle, _ in pairs(trackedHandles) do
+            stopTrackingHandle(handle)
+        end
+    end
+end)
